@@ -1579,20 +1579,32 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
+        use_local_attn = (
+            self.local_attn_builder is not None
+            and self.local_attn_builder.applies(layer, metadata)
+        )
+        # DP padding can add query sequences during draft extension. FA3
+        # requires one scale row per sequence in its actual query metadata.
+        logical_batch_size = forward_batch.batch_size
+        if (
+            self.fa_impl_ver == 3
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and not self.use_mla
+            and not use_local_attn
+            and not is_swa_layer
+            and not layer.is_cross_attention
+            and not cp_active
+        ):
+            logical_batch_size = metadata.cu_seqlens_q.shape[0] - 1
         q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
             q,
             q_rope,
             k_rope,
             layer,
-            logical_batch_size=forward_batch.batch_size,
+            logical_batch_size=logical_batch_size,
             kv_head_num=layer.tp_k_head_num,
             is_prefill=True,
         )
-        use_local_attn = (
-            self.local_attn_builder is not None
-            and self.local_attn_builder.applies(layer, metadata)
-        )
-
         # We do cascade attention for Target Verify with topk > 1
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.

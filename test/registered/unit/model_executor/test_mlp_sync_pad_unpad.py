@@ -21,7 +21,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -53,6 +53,97 @@ def _logits_output(num_rows: int) -> SimpleNamespace:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_padded_idle_rank_has_no_local_logits_rows(self):
+        # Prefill graphs can turn an idle rank into a non-empty dummy EXTEND.
+        # With a 64k draft vocabulary, keeping 8192 dummy rows would allocate
+        # 1.95 GiB just for the FP32 logits of a rank with no real requests.
+        for rows in (0, 1, 8192):
+            for aux_layout in ("none", "list", "packed"):
+                with self.subTest(rows=rows, aux_layout=aux_layout):
+                    batch = ForwardBatch(
+                        forward_mode=ForwardMode.EXTEND,
+                        batch_size=1,
+                        input_ids=torch.zeros(rows, dtype=torch.int64),
+                        req_pool_indices=torch.tensor([0]),
+                        seq_lens=torch.tensor([rows]),
+                        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+                        seq_lens_sum=rows,
+                        positions=torch.arange(rows),
+                        extend_seq_lens=torch.tensor([rows]),
+                        extend_seq_lens_cpu=[rows],
+                        _original_forward_mode=ForwardMode.IDLE,
+                        _original_batch_size=0,
+                    )
+                    hidden = torch.randn(rows, 4)
+                    before_norm = torch.randn(rows, 4)
+                    aux = {
+                        "none": None,
+                        "list": [hidden, before_norm],
+                        "packed": torch.cat([hidden, before_norm], dim=-1),
+                    }[aux_layout]
+                    metadata = LogitsMetadata.from_forward_batch(batch)
+                    pruned, pre_norm, aux_pruned, *indices = (
+                        LogitsProcessor._get_pruned_states(
+                            None, hidden, before_norm, aux, metadata
+                        )
+                    )
+                    self.assertEqual(pruned.shape, (0, 4))
+                    self.assertEqual(pre_norm.shape, (0, 4))
+                    self.assertEqual(indices, [None, None, []])
+                    if aux_layout == "list":
+                        self.assertTrue(all(x.shape == (0, 4) for x in aux_pruned))
+                    elif aux_layout == "packed":
+                        self.assertEqual(aux_pruned.shape, (0, 8))
+                    else:
+                        self.assertIsNone(aux_pruned)
+                    # Do not alter the padded model input or its execution mode.
+                    self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
+                    self.assertEqual(batch.input_ids.numel(), rows)
+                    self.assertEqual(hidden.shape, (rows, 4))
+
+    def test_idle_logits_pruning_preserves_full_hidden_capture(self):
+        hidden = torch.randn(8192, 4)
+        for capture_mode in (CaptureHiddenMode.FULL, CaptureHiddenMode.LAST):
+            with self.subTest(capture_mode=capture_mode):
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.IDLE, capture_hidden_mode=capture_mode
+                )
+                pruned, pre_norm, aux_pruned, samples, *_ = (
+                    LogitsProcessor._get_pruned_states(
+                        None, hidden, None, None, metadata
+                    )
+                )
+                captured = LogitsProcessor._get_hidden_states_to_store(
+                    None, hidden, None, None, pruned, pre_norm, aux_pruned,
+                    samples, metadata,
+                )
+                if capture_mode == CaptureHiddenMode.FULL:
+                    self.assertIs(captured, hidden)
+                else:
+                    self.assertEqual(captured.shape, (0, 4))
+
+    def test_idle_pruning_does_not_change_active_rows(self):
+        hidden = torch.randn(8, 4)
+        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE,
+                     ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            with self.subTest(mode=mode):
+                metadata = LogitsMetadata(
+                    forward_mode=mode,
+                    extend_seq_lens=torch.tensor([3, 5]),
+                    draft_extend_select_index=(
+                        torch.tensor([1, 6])
+                        if mode == ForwardMode.DRAFT_EXTEND_V2 else None
+                    ),
+                )
+                pruned, *_ = LogitsProcessor._get_pruned_states(
+                    None, hidden, None, None, metadata
+                )
+                expected = (
+                    hidden[[2, 7]] if mode == ForwardMode.EXTEND else
+                    hidden[[1, 6]] if mode == ForwardMode.DRAFT_EXTEND_V2 else hidden
+                )
+                torch.testing.assert_close(pruned, expected, rtol=0, atol=0)
+
     def test_idle_rank_does_not_index_dummy_last_token(self):
         # MLP-sync turns an idle rank into a dummy zero-token EXTEND batch.
         empty = torch.empty(0, dtype=torch.int64)

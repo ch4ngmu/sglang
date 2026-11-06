@@ -888,8 +888,23 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
+        # MLP-sync may pad an idle rank to a full prefill graph bucket. Those
+        # rows are needed by the model collectives, but none needs local logits.
+        # Keep the normal logits path so this rank still joins TP/DP collectives.
+        if logits_metadata.forward_mode.is_idle():
+            pruned_states = hidden_states[:0]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[:0]
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states[:0]
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden[:0] for hidden in aux_hidden_states]
+                )
+            sample_indices = None
+            input_logprob_indices = None
+        elif (
+            logits_metadata.forward_mode.is_decode()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
